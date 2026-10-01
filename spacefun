@@ -1,0 +1,548 @@
+#!/bin/bash
+#
+# spacefun - apply Debian's classic SpaceFun theme (Debian 6.0 "Squeeze")
+#
+# Debian still ships the SpaceFun artwork in desktop-base. This script
+# just points the various independent subsystems (alternatives, GRUB,
+# Plymouth, the login greeter and the desktop) at it, and remembers what
+# was there before so it can be put back.
+#
+#   sudo spacefun install     system: theme, GRUB, Plymouth, login screen
+#   sudo spacefun restore     undo 'install'
+#        spacefun desktop     user: set the desktop wallpaper
+#        spacefun desktop --restore
+#        spacefun status
+#
+# Pass -n before the command to print what would be changed without
+# changing anything.
+#
+
+set -euo pipefail
+
+THEME="spacefun"
+BASE="/usr/share/desktop-base/${THEME}-theme"
+STATE_DIR="/var/lib/spacefun"
+STATE_FILE="$STATE_DIR/state"
+GRUB_DROPIN="/etc/default/grub.d/spacefun.cfg"
+GREETER_CONF="/etc/lightdm/lightdm-gtk-greeter.conf"
+USER_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/spacefun"
+USER_STATE_FILE="$USER_STATE_DIR/desktop"
+
+PATH="$PATH:/usr/sbin:/sbin"
+DRY_RUN=0
+
+msg()  { echo "==> $*"; }
+warn() { echo "WARNING: $*" >&2; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+
+# Run a command that changes the system (or just print it with -n).
+run() {
+    if (( DRY_RUN )); then
+        echo "    would run: $*"
+    else
+        "$@"
+    fi
+}
+
+need_root() {
+    (( DRY_RUN )) && return 0
+    [[ $EUID -eq 0 ]] || die "'$1' changes system settings; run it with sudo."
+}
+
+need_theme() {
+    [[ -d "$BASE" ]] || die "$BASE not found. Is this Debian with desktop-base installed?"
+}
+
+#
+# Display geometry: the aspect ratio of the first connected screen, used
+# to pick between the wallpaper and GRUB variants SpaceFun ships.
+#
+screen_size() {
+    local c
+    for c in /sys/class/drm/card*-*; do
+        [[ "$(cat "$c/status" 2>/dev/null)" == connected ]] || continue
+        head -n1 "$c/modes" 2>/dev/null && return 0
+    done
+    echo "1920x1080"
+}
+
+# Prints the aspect ratio * 100 (e.g. 160 for 16:10).
+screen_aspect() {
+    local size w h
+    size="$(screen_size)"
+    w="${size%x*}"
+    h="${size#*x}"
+    h="${h%%[^0-9]*}"
+    echo $(( w * 100 / h ))
+}
+
+wallpaper_image() {
+    local a
+    a="$(screen_aspect)"
+    if   (( a < 140 )); then echo "$BASE/wallpaper/contents/images/1280x1024.svg"
+    elif (( a < 170 )); then echo "$BASE/wallpaper/contents/images/1920x1200.svg"
+    else                     echo "$BASE/wallpaper/contents/images/1920x1080.svg"
+    fi
+}
+
+grub_image() {
+    if (( $(screen_aspect) < 150 )); then
+        echo "$BASE/grub/grub-4x3.png"
+    else
+        echo "$BASE/grub/grub-16x9.png"
+    fi
+}
+
+#
+# Alternatives that desktop-base provides. desktop-theme moves the whole
+# active-theme symlink; the others are set explicitly as well so that any
+# that were previously pinned to another theme also follow.
+#
+alt_target() {
+    case "$1" in
+        desktop-theme)            echo "$BASE" ;;
+        desktop-background)       wallpaper_image ;;
+        desktop-background.xml)   echo "$BASE/wallpaper/gnome-background.xml" ;;
+        desktop-lockscreen.xml)   echo "$BASE/lockscreen/gnome-background.xml" ;;
+        desktop-login-background) echo "$BASE/login/background.svg" ;;
+        desktop-grub)             grub_image ;;
+    esac
+}
+
+ALTERNATIVES=(
+    desktop-theme
+    desktop-background
+    desktop-background.xml
+    desktop-lockscreen.xml
+    desktop-login-background
+    desktop-grub
+)
+
+alt_field() {
+    update-alternatives --query "$1" 2>/dev/null |
+        sed -n "s/^$2: //p" | head -n1
+}
+
+alt_has_choice() {
+    update-alternatives --list "$1" 2>/dev/null | grep -qxF "$2"
+}
+
+plymouth_theme() {
+    plymouth-set-default-theme 2>/dev/null || true
+}
+
+# Was the Plymouth theme set explicitly, or inherited from the defaults?
+plymouth_theme_is_explicit() {
+    grep -qE '^[[:blank:]]*Theme[[:blank:]]*=' /etc/plymouth/plymouthd.conf 2>/dev/null
+}
+
+# The kernel command line GRUB will generate, including grub.d drop-ins.
+grub_cmdline_default() {
+    (
+        set +eu
+        . /etc/default/grub 2>/dev/null
+        for f in /etc/default/grub.d/*.cfg; do
+            [[ -r "$f" ]] && . "$f"
+        done
+        echo "$GRUB_CMDLINE_LINUX_DEFAULT"
+    )
+}
+
+display_manager() {
+    basename "$(cat /etc/X11/default-display-manager 2>/dev/null || echo unknown)"
+}
+
+# The background= line in the admin's gtk greeter config, if any.
+greeter_background() {
+    [[ -r "$GREETER_CONF" ]] || return 0
+    sed -n 's/^[[:blank:]]*background[[:blank:]]*=[[:blank:]]*//p' "$GREETER_CONF" | tail -n1
+}
+
+save_var() {
+    printf '%s=%q\n' "$1" "$2"
+}
+
+#
+# install
+#
+cmd_install() {
+    need_root install
+
+    local pkgs=() p
+    for p in desktop-base plymouth; do
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' ||
+            pkgs+=("$p")
+    done
+    if (( ${#pkgs[@]} )); then
+        msg "Installing ${pkgs[*]}"
+        run apt-get update
+        run apt-get install -y "${pkgs[@]}"
+    fi
+
+    need_theme
+
+    # Record the original configuration once, so re-running install does
+    # not overwrite it with SpaceFun settings.
+    if [[ -f "$STATE_FILE" ]]; then
+        msg "Previous configuration already recorded in $STATE_FILE"
+    else
+        msg "Recording current configuration in $STATE_FILE"
+        local state="" name
+        for name in "${ALTERNATIVES[@]}"; do
+            state+="$(save_var "ALT_STATUS_${name//[-.]/_}" "$(alt_field "$name" Status)")"$'\n'
+            state+="$(save_var "ALT_VALUE_${name//[-.]/_}" "$(alt_field "$name" Value)")"$'\n'
+        done
+        if plymouth_theme_is_explicit; then
+            state+="$(save_var PLYMOUTH_THEME "$(plymouth_theme)")"$'\n'
+        else
+            state+="$(save_var PLYMOUTH_THEME "")"$'\n'
+        fi
+        if (( DRY_RUN )); then
+            printf '%s' "$state" | sed 's/^/    would save: /'
+        else
+            mkdir -p "$STATE_DIR"
+            printf '%s' "$state" > "$STATE_FILE"
+        fi
+    fi
+
+    local grub_changed=0 initramfs_changed=0 name target
+
+    #
+    # desktop-base alternatives
+    #
+    msg "Selecting SpaceFun in desktop-base alternatives"
+    for name in "${ALTERNATIVES[@]}"; do
+        target="$(alt_target "$name")"
+        if ! alt_has_choice "$name" "$target"; then
+            warn "$name has no SpaceFun choice ($target); skipping."
+            continue
+        fi
+        if [[ "$(alt_field "$name" Status)" == manual &&
+              "$(alt_field "$name" Value)" == "$target" ]]; then
+            echo "    $name: already SpaceFun"
+            continue
+        fi
+        run update-alternatives --set "$name" "$target"
+        [[ "$name" == desktop-grub ]] && grub_changed=1
+    done
+
+    #
+    # Plymouth (boot splash)
+    #
+    msg "Configuring the Plymouth boot splash"
+    if [[ "$(plymouth_theme)" == "$THEME" ]]; then
+        echo "    already SpaceFun"
+    elif plymouth-set-default-theme --list 2>/dev/null | grep -qx "$THEME"; then
+        run plymouth-set-default-theme "$THEME"
+        initramfs_changed=1
+    else
+        warn "Plymouth does not know about the $THEME theme; skipping."
+    fi
+
+    #
+    # GRUB has to pass 'splash' to the kernel for Plymouth to show.
+    #
+    if [[ -f /etc/default/grub ]]; then
+        msg "Checking the kernel command line for 'splash'"
+        if grep -qw splash <<< "$(grub_cmdline_default)"; then
+            echo "    already present"
+        else
+            echo "    adding it via $GRUB_DROPIN"
+            if (( DRY_RUN )); then
+                echo "    would write: $GRUB_DROPIN"
+            else
+                mkdir -p "$(dirname "$GRUB_DROPIN")"
+                cat > "$GRUB_DROPIN" <<'EOF'
+# Added by spacefun so the Plymouth splash is shown.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT splash"
+EOF
+            fi
+            grub_changed=1
+        fi
+    else
+        warn "/etc/default/grub not found; skipping GRUB (not booting with GRUB?)."
+    fi
+
+    #
+    # Login screen
+    #
+    local dm
+    dm="$(display_manager)"
+    msg "Configuring the login screen ($dm)"
+    case "$dm" in
+        lightdm)
+            # Debian's greeter default already uses login-background.svg,
+            # which now follows SpaceFun. Only an explicit background= in
+            # the admin's config gets in the way.
+            local bg
+            bg="$(greeter_background)"
+            if [[ -z "$bg" ]]; then
+                echo "    using Debian's default login background (now SpaceFun)"
+            elif [[ "$(readlink -f "$bg")" == "$BASE"/* ]]; then
+                echo "    already SpaceFun"
+            else
+                echo "    commenting out background=$bg in $GREETER_CONF"
+                if [[ ! -f "$STATE_DIR/lightdm-gtk-greeter.conf" ]]; then
+                    run cp -p "$GREETER_CONF" "$STATE_DIR/lightdm-gtk-greeter.conf"
+                fi
+                run sed -i 's/^\([[:blank:]]*background[[:blank:]]*=\)/#\1/' "$GREETER_CONF"
+            fi
+            ;;
+        sddm|gdm|gdm3)
+            echo "    uses desktop-base's login background (now SpaceFun)"
+            ;;
+        *)
+            warn "Don't know how to configure the '$dm' login screen; skipping."
+            ;;
+    esac
+
+    if (( grub_changed )) && command -v update-grub >/dev/null; then
+        msg "Regenerating GRUB configuration"
+        run update-grub
+    fi
+    if (( initramfs_changed )); then
+        msg "Rebuilding initramfs so Plymouth has the new theme"
+        run update-initramfs -u -k all
+    fi
+
+    echo
+    echo "System-level SpaceFun configuration complete. Reboot to see it."
+    echo "To set your desktop wallpaper, run (without sudo):  spacefun desktop"
+}
+
+#
+# restore
+#
+cmd_restore() {
+    need_root restore
+    [[ -f "$STATE_FILE" ]] || die "No saved configuration in $STATE_FILE; nothing to restore."
+
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+
+    local grub_changed=0 initramfs_changed=0 name key status value
+
+    msg "Restoring desktop-base alternatives"
+    for name in "${ALTERNATIVES[@]}"; do
+        key="${name//[-.]/_}"
+        status="$(eval "echo \"\${ALT_STATUS_$key:-}\"")"
+        value="$(eval "echo \"\${ALT_VALUE_$key:-}\"")"
+        if [[ "$status" == manual && -n "$value" ]]; then
+            run update-alternatives --set "$name" "$value"
+        elif [[ -n "$status" ]]; then
+            run update-alternatives --auto "$name"
+        fi
+    done
+    grub_changed=1
+
+    msg "Restoring the Plymouth theme"
+    if [[ -n "${PLYMOUTH_THEME:-}" ]]; then
+        [[ "$(plymouth_theme)" == "$PLYMOUTH_THEME" ]] ||
+            { run plymouth-set-default-theme "$PLYMOUTH_THEME"; initramfs_changed=1; }
+    else
+        run plymouth-set-default-theme --reset
+        initramfs_changed=1
+    fi
+
+    if [[ -f "$GRUB_DROPIN" ]]; then
+        msg "Removing $GRUB_DROPIN"
+        run rm -f "$GRUB_DROPIN"
+    fi
+
+    if [[ -f "$STATE_DIR/lightdm-gtk-greeter.conf" ]]; then
+        msg "Restoring $GREETER_CONF"
+        run cp -p "$STATE_DIR/lightdm-gtk-greeter.conf" "$GREETER_CONF"
+    fi
+
+    if (( grub_changed )) && command -v update-grub >/dev/null; then
+        msg "Regenerating GRUB configuration"
+        run update-grub
+    fi
+    if (( initramfs_changed )); then
+        msg "Rebuilding initramfs"
+        run update-initramfs -u -k all
+    fi
+
+    run rm -rf "$STATE_DIR"
+
+    echo
+    echo "Previous configuration restored. Reboot to see it."
+    echo "To restore your desktop wallpaper, run (without sudo):  spacefun desktop --restore"
+}
+
+#
+# desktop (per user)
+#
+desktop_kind() {
+    case "${XDG_CURRENT_DESKTOP:-}" in
+        *MATE*)                echo mate ;;
+        *Cinnamon*|*X-Cinnamon*) echo cinnamon ;;
+        *GNOME*|*Unity*|*Budgie*) echo gnome ;;
+        *XFCE*)                echo xfce ;;
+        *KDE*)                 echo kde ;;
+        *)                     echo unknown ;;
+    esac
+}
+
+# gsettings schema/keys used for each desktop.
+gsettings_keys() {
+    case "$1" in
+        mate)     echo "org.mate.background picture-filename picture-options" ;;
+        gnome)    echo "org.gnome.desktop.background picture-uri picture-uri-dark picture-options" ;;
+        cinnamon) echo "org.cinnamon.desktop.background picture-uri picture-options" ;;
+    esac
+}
+
+current_wallpaper() {
+    local kind="$1" schema
+    case "$kind" in
+        mate)
+            gsettings get org.mate.background picture-filename 2>/dev/null ;;
+        gnome|cinnamon)
+            read -r schema _ <<< "$(gsettings_keys "$kind")"
+            gsettings get "$schema" picture-uri 2>/dev/null ;;
+        xfce)
+            xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'last-image$' | head -n1 |
+                xargs -r xfconf-query -c xfce4-desktop -p 2>/dev/null ;;
+    esac
+}
+
+cmd_desktop() {
+    [[ $EUID -ne 0 ]] || die "Run 'spacefun desktop' as your normal user, not with sudo."
+
+    local kind restore=0
+    [[ "${1:-}" == --restore ]] && restore=1
+    kind="$(desktop_kind)"
+
+    if (( restore )); then
+        [[ -f "$USER_STATE_FILE" ]] || die "No saved wallpaper in $USER_STATE_FILE."
+        msg "Restoring $kind wallpaper"
+        local line
+        while IFS= read -r line; do
+            # shellcheck disable=SC2086
+            eval "run $line"
+        done < "$USER_STATE_FILE"
+        run rm -f "$USER_STATE_FILE"
+        return 0
+    fi
+
+    need_theme
+    local img uri saved="" schema keys key prop
+    img="$(wallpaper_image)"
+    uri="file://$img"
+
+    msg "Setting $kind wallpaper to $img"
+    case "$kind" in
+        mate|gnome|cinnamon)
+            read -r schema keys <<< "$(gsettings_keys "$kind")"
+            for key in $keys; do
+                gsettings writable "$schema" "$key" >/dev/null 2>&1 || continue
+                saved+="gsettings set $schema $key $(printf '%q' "$(gsettings get "$schema" "$key")")"$'\n'
+            done
+            if [[ "$kind" == mate ]]; then
+                run gsettings set "$schema" picture-filename "$img"
+            else
+                run gsettings set "$schema" picture-uri "$uri"
+                gsettings writable "$schema" picture-uri-dark >/dev/null 2>&1 &&
+                    run gsettings set "$schema" picture-uri-dark "$uri"
+            fi
+            run gsettings set "$schema" picture-options zoom
+            ;;
+        xfce)
+            while IFS= read -r prop; do
+                saved+="xfconf-query -c xfce4-desktop -p $prop -s $(printf '%q' "$(xfconf-query -c xfce4-desktop -p "$prop")")"$'\n'
+                run xfconf-query -c xfce4-desktop -p "$prop" -s "$img"
+            done < <(xfconf-query -c xfce4-desktop -l | grep 'last-image$')
+            ;;
+        kde)
+            command -v plasma-apply-wallpaperimage >/dev/null ||
+                die "plasma-apply-wallpaperimage not found."
+            warn "The previous KDE wallpaper can't be recorded; 'desktop --restore' won't undo this."
+            run plasma-apply-wallpaperimage "$img"
+            ;;
+        *)
+            die "Don't know how to set the wallpaper for '${XDG_CURRENT_DESKTOP:-unknown}'. Image: $img"
+            ;;
+    esac
+
+    if [[ -n "$saved" && ! -f "$USER_STATE_FILE" ]]; then
+        if (( DRY_RUN )); then
+            printf '%s' "$saved" | sed 's/^/    would save: /'
+        else
+            mkdir -p "$USER_STATE_DIR"
+            printf '%s' "$saved" > "$USER_STATE_FILE"
+        fi
+    fi
+}
+
+#
+# status
+#
+mark() {
+    if [[ "$1" == *"${THEME}"* ]]; then echo "SpaceFun ✓"; else echo "not SpaceFun ✗"; fi
+}
+
+cmd_status() {
+    local dm kind bg plymouth cmdline
+    dm="$(display_manager)"
+    kind="$(desktop_kind)"
+    plymouth="$(plymouth_theme)"
+    cmdline="$(grub_cmdline_default)"
+
+    echo "SpaceFun status"
+    echo
+    printf '%-10s %s (%s)\n' Theme    "$(mark "$(alt_field desktop-theme Value)")" "desktop-base active-theme"
+    printf '%-10s %s (%s)\n' GRUB     "$(mark "$(readlink -f /usr/share/images/desktop-base/desktop-grub.png)")" \
+        "$(basename "$(readlink -f /usr/share/images/desktop-base/desktop-grub.png)")"
+    printf '%-10s %s (%s)\n' Plymouth "$(mark "$plymouth")" "${plymouth:-unknown}"
+    if grep -qw splash <<< "$cmdline"; then
+        printf '%-10s %s\n' Splash "enabled ✓"
+    else
+        printf '%-10s %s\n' Splash "'splash' missing from kernel command line ✗"
+    fi
+
+    case "$dm" in
+        lightdm)
+            bg="$(greeter_background)"
+            bg="$(readlink -f "${bg:-/usr/share/images/desktop-base/login-background.svg}")"
+            ;;
+        *)
+            bg="$(readlink -f /usr/share/images/desktop-base/login-background.svg)"
+            ;;
+    esac
+    printf '%-10s %s (%s)\n' Login "$(mark "$bg")" "$dm"
+
+    if [[ $EUID -eq 0 ]]; then
+        printf '%-10s %s\n' Desktop "run 'spacefun status' without sudo to check"
+    else
+        local wp
+        wp="$(current_wallpaper "$kind")"
+        wp="${wp//\'/}"
+        wp="${wp#file://}"
+        [[ "$wp" == /usr/share/images/desktop-base/* ]] && wp="$(readlink -f "$wp")"
+        if [[ -n "$wp" ]]; then
+            printf '%-10s %s (%s)\n' Desktop "$(mark "$wp")" "$kind"
+        else
+            printf '%-10s %s (%s)\n' Desktop "unknown" "$kind"
+        fi
+    fi
+}
+
+usage() {
+    sed -n '3,17s/^# \{0,1\}//p' "$0"
+    exit "${1:-0}"
+}
+
+if [[ "${1:-}" == -n ]]; then
+    DRY_RUN=1
+    shift
+fi
+
+case "${1:-}" in
+    install)  cmd_install ;;
+    restore)  cmd_restore ;;
+    desktop)  shift; cmd_desktop "$@" ;;
+    status)   cmd_status ;;
+    -h|--help|help) usage 0 ;;
+    *)        usage 1 ;;
+esac
